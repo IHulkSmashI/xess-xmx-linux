@@ -263,7 +263,8 @@ HRESULT _INTC_D3D12_RenderSubmitStart(INTCExtensionContext*, uint32_t frameId)
 
 // XeLL / XeSS-FG pacing information. On Windows the driver uses these to pace generated frames and to match
 // present sequence numbers against render-submit timings. The shim's own pacing of XeSS-FG's presents is FgMeter.cpp
-// (IGDEXT_FG_METER); the generated-frame count from here goes to it as a hint. The probe accepts them (S_OK) so that a failed call here
+// (IGDEXT_FG_METER); the generated-frame count from here goes to it as a hint, and with IGDEXT_FG_METER=1 it paces in
+// SetPresentSequenceNumber and both answer S_OK. The probe accepts them (S_OK) so that a failed call here
 // cannot be the reason XeLL stays in cross-vendor mode; the values are logged to see how XeLL uses them.
 HRESULT _INTC_D3D12_SetNumGeneratedFrames(INTCExtensionContext*, UINT NumFrames)
 {
@@ -271,7 +272,7 @@ HRESULT _INTC_D3D12_SetNumGeneratedFrames(INTCExtensionContext*, UINT NumFrames)
     const LONG k = InterlockedIncrement(&n);
     if (NumFrames != last || k <= 8) { TraceF("XELLPROBE SetNumGeneratedFrames(%u) #%ld", NumFrames, (long)k); last = NumFrames; }
     FgMeterNoteFrames(NumFrames, "INTC_D3D12_SetNumGeneratedFrames");   // what the driver would pace (FgMeter.cpp)
-    return ProbeVersion() > 0 ? S_OK : E_NOTIMPL;
+    return ProbeVersion() > 0 || FgMeterAnswersDriver() ? S_OK : E_NOTIMPL;
 }
 
 HRESULT _INTC_D3D12_SetPresentSequenceNumber(INTCExtensionContext*, UINT PresentSequenceNumber)
@@ -279,7 +280,10 @@ HRESULT _INTC_D3D12_SetPresentSequenceNumber(INTCExtensionContext*, UINT Present
     static LONG n = 0;
     const LONG k = InterlockedIncrement(&n);
     if (k <= 40 || (k % 600) == 0) TraceF("XELLPROBE SetPresentSequenceNumber(%u) #%ld", PresentSequenceNumber, (long)k);
-    return ProbeVersion() > 0 ? S_OK : E_NOTIMPL;
+    // XeSS-FG calls this on its presenting thread right before each Present1: with IGDEXT_FG_METER=1 the meter holds the
+    // present here (FgMeter.cpp), without any vtable, and answers S_OK as the Windows driver does so the calls continue
+    const bool metered = FgMeterDriverPresent(PresentSequenceNumber);
+    return ProbeVersion() > 0 || metered ? S_OK : E_NOTIMPL;
 }
 
 HRESULT _INTC_D3D12_GetDisplayTelemetry(INTCExtensionContext*, void* pTelemetryData, UINT size)

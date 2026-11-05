@@ -232,12 +232,14 @@ static void AutoPaceWait(void* ctx, uint32_t frame)
 static uint32_t Hook_Sleep(void* ctx, uint32_t frame)
 {
     LONG n = InterlockedIncrement(&g_sleepCalls);
-    if (!g_log) { const uint32_t rr = g_origSleep(ctx, frame); if (g_capAuto) AutoPaceWait(ctx, frame); return rr; }
+    // FgMeterCeilingWait: the VRR ceiling of IGDEXT_FG_METER=1, a frame cap before input like XeLL's (FgMeter.h)
+    if (!g_log) { const uint32_t rr = g_origSleep(ctx, frame); if (g_capAuto) AutoPaceWait(ctx, frame); FgMeterCeilingWait(); return rr; }
     if (n == 1 && g_setLog) XLog("xellSetLoggingCallback(debug) -> %u", g_setLog(ctx, 0, XellLogCb));
     if (n < 5 || (n % 600) == 0) XLog("xellSleep call #%ld frame=%u", (long) n, frame);
     LARGE_INTEGER qa, qb, qf; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&qa);
     uint32_t rr = g_origSleep(ctx, frame);
     if (g_capAuto) AutoPaceWait(ctx, frame);
+    FgMeterCeilingWait();
     QueryPerformanceCounter(&qb);
     static double sum = 0, mx = 0; static int cnt = 0; static LARGE_INTEGER t0;
     double d = (qb.QuadPart - qa.QuadPart) * 1000.0 / qf.QuadPart;

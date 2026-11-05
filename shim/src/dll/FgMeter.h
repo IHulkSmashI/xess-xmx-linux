@@ -1,6 +1,6 @@
 // FgMeter.h - even flips for XeSS frame generation (FgMeter.cpp): what Intel's Windows driver does with
 // SetNumGeneratedFrames / SetPresentSequenceNumber, done in the shim on the presents XeSS-FG makes.
-//   IGDEXT_FG_METER=1        pace XeSS-FG's presents
+//   IGDEXT_FG_METER=1        pace XeSS-FG's presents (and keep the flips under the VRR ceiling)
 //   IGDEXT_FG_METER=measure  measure only: the hooks go in, nothing waits (a pacing summary every 2 s with IGDEXT_XELL_LOG=1)
 //   IGDEXT_FG_METER=0/unset  off: nothing is installed, whatever IGDEXT_XELL_LOG says (the default)
 #pragma once
@@ -34,6 +34,19 @@ double FgMeterHeldMs(uint64_t fromNs, uint64_t toNs);
 // meter logs the added latency (the part of the hold that made the next frame start late) and keeps later holds
 // within the slack.
 void FgMeterXellFrame(double heldMs, double leftMs, double slackMs);
+
+// XellDriver.cpp: INTC_D3D12_SetPresentSequenceNumber, which XeSS-FG calls on its presenting thread right before each
+// Present1 (the driver's flip-metering input on Windows). With pacing on the meter holds here - no vtable is involved -
+// and the hook on DXVK's Present skips that present. True: pacing is on, answer S_OK (as the Windows driver does) so
+// XeSS-FG keeps calling it; false: answer as before.
+bool FgMeterDriverPresent(uint32_t sequence);
+// XellDriver.cpp: answer SetNumGeneratedFrames / SetPresentSequenceNumber with S_OK (pacing on)
+bool FgMeterAnswersDriver();
+// XellHook.cpp's xellSleep hook, before the game samples input: the VRR ceiling. The flips must not come faster than
+// the panel's maximum less 2 Hz (IGDEXT_FG_METER_HZ, else the display mode's refresh rate), so with N generated frames
+// a rendered frame starts no sooner than (N + 1) / ceiling after the previous one - a frame cap where XeLL's would be,
+// not a hold after rendering.
+void FgMeterCeilingWait();
 
 // XellHook.cpp: frame generation on (1), off (0) or not seen (-1), from xefgSwapChainSetEnabled / xellSetFgEnabled
 int XefgFrameGenerationState();

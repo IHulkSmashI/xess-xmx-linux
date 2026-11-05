@@ -20,6 +20,9 @@
 //   pace      IGDEXT_FG_METER=1, 5 ms CPU per 16.67 ms frame: even flips, the frame rate kept, added latency ~0
 //   heavy     IGDEXT_FG_METER=1, 12 ms CPU: the next frame can absorb only 4.7 ms; holds stay within it, frame rate kept
 //   nocouple  IGDEXT_FG_METER=1 with a low latency that ignores the hold: shows what the coupling prevents (informative)
+//   driver    as pace, and XeSS-FG calls INTC_D3D12_SetPresentSequenceNumber before each present: held there, once
+//   driveronly  as driver, but no factory is seen (no DXGI hook at all): paced from SetPresentSequenceNumber alone
+//   ceiling   IGDEXT_FG_METER_HZ=100, the game at 71 fps 2x (142 flips/s): rendered frames start >= 2 / 98 s apart
 // In every case: no crash, the wrapper's vtable untouched; with the meter in, a present on a copy of the hooked vtable
 // fails with DXGI_ERROR_INVALID_CALL and calls nothing.
 #include "Stdafx.h"
@@ -105,6 +108,7 @@ static Spacing Intervals(const double* t, int from, int to, double expected)
 static int Child(const std::string& mode)
 {
     const bool off = mode == "off", measure = mode == "measure", heavy = mode == "heavy", nocouple = mode == "nocouple";
+    const bool seq = mode == "driver" || mode == "driveronly", noFactory = mode == "driveronly", ceiling = mode == "ceiling";
     printf("== %s: IGDEXT_FG_METER=%s, meter %s\n", mode.c_str(), off ? "(unset)" : measure ? "measure" : "1",
            FgMeterOn() ? "pacing" : FgMeterWanted() ? "measuring" : "off");
     wchar_t dir[MAX_PATH]; DWORD n = GetModuleFileNameW(nullptr, dir, MAX_PATH);
@@ -126,7 +130,7 @@ static int Child(const std::string& mode)
 
     // xefgSwapChainD3D12InitFromSwapChain(wrapper): XeSS-FG creates its swap chain through the factory inside the call
     int ctx = 0;
-    FgMeterInitBegin(&wrap, nullptr);
+    FgMeterInitBegin(noFactory ? nullptr : &wrap, nullptr);
     void* xefgSc = nullptr;
     ((PFN_ForHwnd) Vt(factory)[15])(factory, nullptr, nullptr, nullptr, nullptr, nullptr, &xefgSc);
     FgMeterInitEnd(&ctx, 0);
@@ -134,9 +138,10 @@ static int Child(const std::string& mode)
 
     Check(!memcmp(wrapBefore, kWrapVtbl, sizeof(wrapBefore)), "the wrapper's vtable (outside DXVK's dxgi) is not patched");
     const bool facHooked = memcmp(facBefore, Vt(factory), sizeof(facBefore)) != 0, scHooked = memcmp(scBefore, Vt(gameSc), sizeof(scBefore)) != 0;
-    if (off) Check(!FgMeterWanted() && !facHooked && !scHooked, "meter off with IGDEXT_XELL_LOG=1: nothing installed");
+    if (off) Check(!FgMeterWanted() && !facHooked && !scHooked && !FgMeterAnswersDriver(), "meter off with IGDEXT_XELL_LOG=1: nothing installed");
+    else if (noFactory) Check(!facHooked && !scHooked, "no factory: no DXGI hook");
     else Check(facHooked && scHooked, "DXVK's factory and swap chain class hooked");
-    if (!off)
+    if (!off && !noFactory)
     {
         // a copy of the hooked vtable (as another hook might make): no original of another class is called
         void* copy[40]; memcpy(copy, Vt(xefgSc), sizeof(copy));
@@ -147,7 +152,7 @@ static int Child(const std::string& mode)
     }
 
     // the game loop: 60 rendered frames per second (GPU-bound), 2x
-    const double P = 16.667, C = heavy ? 12.0 : 5.0;
+    const double P = ceiling ? 14.0 : 16.667, C = heavy ? 12.0 : 5.0;
     const int frames = 480, from = 150;   // measured from 2.5 s on (the meter and the low latency settled)
     double inPresent = 0, inPresentMax = 0, latency = 0, sleepSum = 0; int measured = 0;
     double next = NowMs() + 20, prevReady = 0, firstStart = 0, lastStart = 0;
@@ -155,6 +160,7 @@ static int Child(const std::string& mode)
     {
         const double s0 = NowMs();
         WaitUntil(next);                                       // the low latency's wait
+        FgMeterCeilingWait();                                  // ... and the VRR ceiling, in the same xellSleep hook
         const double simStart = NowMs();
         WaitUntil(simStart + C);                               // simulation and render submit
         const double ready = std::max(NowMs(), prevReady + P); // the GPU's pace
@@ -162,7 +168,9 @@ static int Child(const std::string& mode)
         FgMeterRealFrame(&ctx, (uint32_t) f + 1);              // xefgSwapChainTagFrameConstants
         const uint64_t prS = QpcNs();                          // XELL_PRESENT_START
         ((PFN_P) Vt(&wrap)[8])(&wrap, 0, 0);                   // the game presents through the wrapper ...
+        if (seq) FgMeterDriverPresent(2 * f);                  // XeSS-FG: SetPresentSequenceNumber, then Present1
         ((PFN_P) Vt(xefgSc)[8])(xefgSc, 0, 0);                 // ... XeSS-FG: the generated frame
+        if (seq) FgMeterDriverPresent(2 * f + 1);
         ((PFN_P) Vt(xefgSc)[8])(xefgSc, 0, 0);                 // ... and the real one
         const uint64_t prE = QpcNs();                          // XELL_PRESENT_END
         const double* flips; const int nf = flipsOf(xefgSc, &flips);
@@ -182,16 +190,23 @@ static int Child(const std::string& mode)
         }
     }
     const double* flips; const int nf = flipsOf(xefgSc, &flips);
-    const Spacing sp = Intervals(flips, 2 * from, nf, P / 2);
     const double period = (lastStart - firstStart) / (measured - 1);
+    const Spacing sp = Intervals(flips, 2 * from, nf, period / 2);
     printf("RESULT %-8s game thread in Present %.2f ms/frame (max %.2f), waiting in the low latency %.2f ms/frame;"
            " flips: interval mean %.2f sd %.2f ms, short %d%% (%d host stalls left out); real frame period %.2f ms; sim start -> real flip %.2f ms;"
            " meter log: held %.2f ms, added latency avg %.3f max %.3f ms, spin per present avg %.3f max %.3f ms, xell-slack caps %d\n",
            mode.c_str(), inPresent / measured, inPresentMax, sleepSum / measured, sp.mean, sp.sd, sp.shortPct, sp.stalls, period,
            latency / measured, g_ml.heldAvg, g_ml.addedAvg, g_ml.addedMax, g_ml.spinAvg, g_ml.spinMax, g_ml.xellCapped);
     if (off || measure) Check(sp.shortPct > 30, "without pacing the flips come in bursts (the problem)");
-    if (FgMeterOn() && !nocouple)
+    if (ceiling)
     {
+        Check(period > 2000.0 / 98 - 0.2 && period < 2000.0 / 98 + 0.6, "rendered frames held to the VRR ceiling (20.41 ms at 2x under 98 Hz)");
+        Check(sp.shortPct == 0 && sp.sd < 1.0, "even flips under the ceiling");
+        Check(g_ml.addedAvg >= 0 && g_ml.addedAvg < 0.1, "added latency per real frame under 0.1 ms on average");
+    }
+    else if (FgMeterOn() && !nocouple)
+    {
+        if (seq) Check(g_ml.heldAvg > 6 && g_ml.heldAvg < 10, "each present held once (SetPresentSequenceNumber, then not again in Present)");
         Check(std::fabs(period - P) < 0.02 * P, "the real frame rate is kept (the hold is absorbed by the low latency's wait)");
         Check(g_ml.addedAvg >= 0 && g_ml.addedAvg < 0.1, "added latency per real frame under 0.1 ms on average");
         // the spin is planned at 0.05-0.5 ms; a measured maximum above that is the test machine descheduling the thread
@@ -209,12 +224,14 @@ int main(int argc, char** argv)
     if (argc > 1) return Child(argv[1]);
     char exe[MAX_PATH]; GetModuleFileNameA(nullptr, exe, MAX_PATH);
     struct { const char* mode; const char* meter; } cases[] = {
-        { "off", nullptr }, { "measure", "measure" }, { "pace", "1" }, { "heavy", "1" }, { "nocouple", "1" } };
+        { "off", nullptr }, { "measure", "measure" }, { "pace", "1" }, { "heavy", "1" }, { "nocouple", "1" },
+        { "driver", "1" }, { "driveronly", "1" }, { "ceiling", "1" } };
     int failed = 0;
     for (auto& c : cases)
     {
         SetEnvironmentVariableA("IGDEXT_XELL_LOG", "1");   // ClawDeck's default: must not install anything by itself
         SetEnvironmentVariableA("IGDEXT_FG_METER", c.meter);
+        SetEnvironmentVariableA("IGDEXT_FG_METER_HZ", strcmp(c.mode, "ceiling") ? "0" : "100");   // 0: no ceiling
         std::string cmd = std::string("\"") + exe + "\" " + c.mode;
         STARTUPINFOA si = { sizeof(si) }; PROCESS_INFORMATION pi = {};
         if (!CreateProcessA(nullptr, &cmd[0], nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) { printf("FAIL: %s not started\n", c.mode); ++failed; continue; }

@@ -22,21 +22,33 @@
 // nothing is paced and the log says why. A present on a vtable the meter did not patch (a copy of a patched one) calls
 // no original of another class: it fails with DXGI_ERROR_INVALID_CALL, logged once.
 //
+// Where the hold happens: in INTC_D3D12_SetPresentSequenceNumber when XeSS-FG calls it (right before each Present1, on
+// its presenting thread; the shim answers it S_OK while pacing, as the Windows driver does), so no vtable is needed;
+// otherwise in the hook on DXVK's Present / Present1 (each present is held once, in whichever comes first). On the
+// Intel path XeSS-FG's own software pacer is off and it starts its async presenter thread only from 3x on, so at 2x the
+// presenting thread is the game's render thread.
+//
 // Why the wait stays on the presenting thread (no FSR 3 style presenter thread): AMD's FrameInterpolationSwapchainDX12
 // owns the whole swap chain - its own back buffers, its own GetCurrentBackBufferIndex, copies on its own present queue,
 // and the real Present is called only from its presenter thread. Underneath XeSS-FG's proxy the meter owns none of
 // that. Deferring DXVK's Present to another thread would (1) leave GetCurrentBackBufferIndex unadvanced when XeSS-FG
 // returns and copies the next frame, so it would write into the buffer still waiting to be shown; (2) order the present
-// on the D3D12 queue (vkd3d-proton records it into the queue's timeline at the call) behind the work submitted after
-// it - the game's whole next frame - so the frame would be shown a frame later, not paced; (3) race ResizeBuffers,
+// on the D3D12 queue behind the work submitted after it - the game's whole next frame - so the frame would be shown a
+// frame later, not paced (vkd3d-proton's dxgi_vk_swap_chain_Present, swapchain.c: d3d12_command_queue_enqueue_callback
+// at the call, then chain->user.index advanced); (3) race ResizeBuffers,
 // SetFullscreenState and Release, which DXGI does not allow concurrently with Present; (4) lose Present's result
 // (occluded, device removed) and the frame-latency wait vkd3d-proton does inside Present. So the present is held where
 // it is, and the hold is made visible to XeLL instead (FgMeterHeldMs / FgMeterXellFrame): on Windows the driver meters
 // the flips without holding the thread, so XeLL's present-end marker is not moved; here the low latency of
 // XellHook.cpp takes the hold off the present end it schedules from, so the next frame starts when it would have
 // without the meter and the hold replaces part of xellSleep's wait instead of adding to it. And a hold never goes
-// beyond what the next frame can absorb (the low latency's slack): pacing gives way before latency does. The 2 s
-// summary logs, per real frame, the hold inside the game's present, and the part of it that was not absorbed (added).
+// beyond what the next frame can absorb (the low latency's slack, or the VRR ceiling's wait): pacing gives way before
+// latency does. The 2 s summary logs, per real frame, the hold inside the game's present, and the part of it that was
+// not absorbed (added).
+//
+// VRR ceiling (FgMeterCeilingWait): the flips must stay under the panel's maximum (120 Hz Claw: 118). When rendered fps
+// x (N + 1) would exceed it, the xellSleep hook starts each rendered frame no sooner than (N + 1) / ceiling after the
+// previous one: a frame cap before input sampling, as Windows XeLL lowers its cap, never a hold after rendering.
 //
 // IGDEXT_FG_METER=1 paces, =measure only measures, 0 or unset installs nothing (whatever IGDEXT_XELL_LOG says; ClawDeck
 // sets that by default). With IGDEXT_XELL_LOG=1 C:\igdext_xell.log gets a summary every 2 s ("fgmeter: ...").
@@ -241,6 +253,7 @@ void AddHold(uint64_t fromNs, uint64_t toNs)
     ReleaseSRWLockExclusive(&g_holdLock);
 }
 
+volatile double g_ceilNextMs = 0;   // FgMeterCeilingWait: the next rendered frame starts no sooner than this
 struct XellStats { int n = 0, added = 0; double sumHeld = 0, maxHeld = 0, sumAdded = 0, maxAdded = 0, sumSlack = 0; };
 SRWLOCK g_xellLock = SRWLOCK_INIT;
 XellStats g_xs;
@@ -290,10 +303,12 @@ struct Target
     FgPacer pacer;
     int fgOn = -1;          // the state the schedule was made for
     double heldThisFrame = 0;   // the holds since the last rendered frame's mark
+    int driverPresents = 0;     // presents metered through SetPresentSequenceNumber since the last summary
     Stats st;
 };
 Target g_targets[4];
 LONG g_nextTarget = 0;
+Target* volatile g_lastTarget = nullptr;   // the context initialized last: the one SetPresentSequenceNumber paces
 volatile LONG g_noted = -1;
 
 Target* FindTarget(void* self)
@@ -311,11 +326,11 @@ void Summary(Target& t, double now, bool pacing)
     const double inSd = std::sqrt(std::max(0.0, s.sumIn2 / iv - inAvg * inAvg));
     const double outSd = std::sqrt(std::max(0.0, s.sumOut2 / iv - outAvg * outAvg));
     const int np = s.nPlan ? s.nPlan : 1;
-    XellLogF("fgmeter %p: %s, %.1f s, %d presents (%.1f/s), real frame %.2f ms, %.2f presents per real frame, spacing %.2f ms"
+    XellLogF("fgmeter %p: %s%s, %.1f s, %d presents (%.1f/s), real frame %.2f ms, %.2f presents per real frame, spacing %.2f ms"
              " | in: interval avg %.2f sd %.2f max %.2f ms, short %d%% | out: avg %.2f sd %.2f max %.2f ms, short %d%%"
              " | waited %d x avg %.2f max %.2f ms, capped %d (interval) %d (xell slack), late %d"
              " | spin per present avg %.3f max %.3f ms, %d sleeps",
-             t.sc, pacing ? "meter on" : "measuring only (IGDEXT_FG_METER=measure)", secs, s.n, s.n / (secs > 0 ? secs : 1),
+             t.sc ? t.sc : t.ctx, pacing ? "meter on" : "measuring only (IGDEXT_FG_METER=measure)", t.driverPresents ? ", from SetPresentSequenceNumber" : "", secs, s.n, s.n / (secs > 0 ? secs : 1),
              s.sumInterval / np, s.sumPerReal / np, s.sumSpacing / np,
              inAvg, inSd, s.maxIn, 100 * s.shortIn / iv, outAvg, outSd, s.maxOut, 100 * s.shortOut / iv,
              s.waited, s.waited ? s.sumWait / s.waited : 0.0, s.maxWait, s.capped, s.xellCapped, s.late,
@@ -333,6 +348,7 @@ void Summary(Target& t, double now, bool pacing)
                  " not absorbed and the added latency is not known; at most the hold above", t.sc);
     s = Stats();
     s.t0 = now;
+    t.driverPresents = 0;
 }
 
 // before the real Present of a target: wait for its turn (pacing on), and count
@@ -357,11 +373,14 @@ void Meter(Target& t)
     bool xellCapped = false;
     if (pacing && p.paced)
     {
-        // never more hold in one frame's present than the next frame can absorb (the low latency's slack)
+        // never more hold in one frame's present than the next frame can absorb: the low latency's slack, or the time
+        // until the VRR ceiling lets the next frame start, whichever is longer
         const double allow = AbsorbableMs(now);
         if (allow >= 0)
         {
-            const double room = allow - t.heldThisFrame;
+            double room = allow - t.heldThisFrame;
+            const double ceil = g_ceilNextMs;
+            if (ceil > now) room = std::max(room, ceil - now - 0.3);
             if (p.targetMs - now > room)
             {
                 xellCapped = true;
@@ -411,15 +430,24 @@ void Meter(Target& t)
 }
 
 thread_local int t_inPresent = 0;   // DXVK's Present calls its Present1: one present, metered once
+thread_local double t_driverMeteredMs = 0;   // this thread's present was metered in SetPresentSequenceNumber just now
+
+// the present was metered already through SetPresentSequenceNumber (XeSS-FG calls it right before Present1)
+bool MeteredByDriver()
+{
+    if (!t_driverMeteredMs) return false;
+    const bool fresh = QpcMs() - t_driverMeteredMs < 50;
+    t_driverMeteredMs = 0;
+    return fresh;
+}
 
 HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* self, UINT sync, UINT flags)
 {
     const ScVtbl* v = FindSc(self);
     if (!v || !v->present) return UnknownVtbl(self, "Present");
-    Target* t = nullptr;
-    if (t_inPresent || (flags & DXGI_PRESENT_TEST) || !(t = FindTarget(self))) return v->present(self, sync, flags);
+    if (t_inPresent || (flags & DXGI_PRESENT_TEST)) return v->present(self, sync, flags);
     ++t_inPresent;
-    Meter(*t);
+    if (Target* t = FindTarget(self)) if (!MeteredByDriver()) Meter(*t);
     const HRESULT hr = v->present(self, sync, flags);
     --t_inPresent;
     return hr;
@@ -429,10 +457,9 @@ HRESULT STDMETHODCALLTYPE Hook_Present1(IDXGISwapChain1* self, UINT sync, UINT f
 {
     const ScVtbl* v = FindSc(self);
     if (!v || !v->present1) return UnknownVtbl(self, "Present1");
-    Target* t = nullptr;
-    if (t_inPresent || (flags & DXGI_PRESENT_TEST) || !(t = FindTarget(self))) return v->present1(self, sync, flags, pp);
+    if (t_inPresent || (flags & DXGI_PRESENT_TEST)) return v->present1(self, sync, flags, pp);
     ++t_inPresent;
-    Meter(*t);
+    if (Target* t = FindTarget(self)) if (!MeteredByDriver()) Meter(*t);
     const HRESULT hr = v->present1(self, sync, flags, pp);
     --t_inPresent;
     return hr;
@@ -592,7 +619,8 @@ bool FgMeterOn()
         const DWORD n = GetEnvironmentVariableA("IGDEXT_FG_METER", b, sizeof(b));
         const bool set = n > 0 && n < sizeof(b);
         g_mode = set && !strcmp(b, "1") ? 1 : set && !_stricmp(b, "measure") ? 2 : 0;
-        if (n > 0 && !g_mode && strcmp(b, "0")) XellLogF("fgmeter: IGDEXT_FG_METER=%s is not 1, measure or 0: off", set ? b : "(too long)");
+        if (set && !strcmp(b, "2")) XellLogF("fgmeter: IGDEXT_FG_METER=2 (vkd3d-proton's frame rate limiter) is not implemented (FgMeter.cpp, TODO): off");
+        else if (n > 0 && !g_mode && strcmp(b, "0")) XellLogF("fgmeter: IGDEXT_FG_METER=%s is not 1, measure or 0: off", set ? b : "(too long)");
     }
     return g_mode == 1;
 }
@@ -628,22 +656,20 @@ void FgMeterInitEnd(void* ctx, int32_t result)
     InterlockedExchange(&g_initActive, 0);
     void* sc = g_adopted;
     if (result != 0) { XellLogF("fgmeter: ctx %p: XeSS-FG initialization failed (%d), nothing paced", ctx, result); return; }
+    void* sc1 = nullptr;
     if (!sc)
-    {
-        XellLogF("fgmeter: ctx %p: nothing paced: %s", ctx,
+        XellLogF("fgmeter: ctx %p: no DXGI hook: %s; paced only if XeSS-FG calls SetPresentSequenceNumber", ctx,
                  !g_initFactoryHooked ? "the factory is not DXVK's (see above), so XeSS-FG's swap chain cannot be seen"
                  : g_adoptedElsewhere ? "XeSS-FG's swap chain was created on another thread" : "XeSS-FG created no swap chain during its initialization");
-        return;
-    }
-    void* sc1 = nullptr;
-    if (!HookSwapChain(sc, &sc1))
+    else if (!HookSwapChain(sc, &sc1))
     {
-        XellLogF("fgmeter: ctx %p: XeSS-FG's swap chain %p is not DXVK's (see above), nothing paced", ctx, sc);
-        return;
+        XellLogF("fgmeter: ctx %p: XeSS-FG's swap chain %p is not DXVK's (see above): no DXGI hook; paced only if XeSS-FG calls"
+                 " SetPresentSequenceNumber", ctx, sc);
+        sc = nullptr; sc1 = nullptr;
     }
     AcquireSRWLockExclusive(&g_patchLock);
     Target* t = nullptr;
-    for (Target& e : g_targets) if (e.ctx == ctx || (!t && !e.sc)) t = &e;
+    for (Target& e : g_targets) if (e.ctx == ctx || (!t && !e.ctx)) t = &e;
     if (!t) t = &g_targets[g_nextTarget++ % 4];
     AcquireSRWLockExclusive(&t->lock);
     t->sc = nullptr; t->sc1 = nullptr;
@@ -654,9 +680,11 @@ void FgMeterInitEnd(void* ctx, int32_t result)
     t->sc1 = sc1 != sc ? sc1 : nullptr;
     t->sc = sc;
     ReleaseSRWLockExclusive(&t->lock);
+    g_lastTarget = t;
     ReleaseSRWLockExclusive(&g_patchLock);
-    XellLogF("fgmeter: ctx %p: swap chain %p (created by XeSS-FG, DXVK's) %s", ctx, sc,
-             FgMeterOn() ? "is paced while frame generation is on (IGDEXT_FG_METER=1)" : "is measured, not paced (IGDEXT_FG_METER=measure)");
+    if (sc)
+        XellLogF("fgmeter: ctx %p: swap chain %p (created by XeSS-FG, DXVK's) %s", ctx, sc,
+                 FgMeterOn() ? "is paced while frame generation is on (IGDEXT_FG_METER=1)" : "is measured, not paced (IGDEXT_FG_METER=measure)");
 }
 
 void FgMeterContextDestroyed(void* ctx)
@@ -669,6 +697,7 @@ void FgMeterContextDestroyed(void* ctx)
             AcquireSRWLockExclusive(&t.lock);
             XellLogF("fgmeter: ctx %p destroyed, swap chain %p no longer paced", ctx, t.sc);
             t.sc = nullptr; t.sc1 = nullptr; t.ctx = nullptr; t.pacer.Reset();
+            if (g_lastTarget == &t) g_lastTarget = nullptr;
             ReleaseSRWLockExclusive(&t.lock);
         }
     ReleaseSRWLockExclusive(&g_patchLock);
@@ -678,7 +707,7 @@ void FgMeterRealFrame(void* ctx, uint32_t presentId)
 {
     if (!ctx || !FgMeterWanted()) return;
     for (Target& t : g_targets)
-        if (t.ctx == ctx && t.sc)
+        if (t.ctx == ctx)
         {
             const double now = QpcMs();
             AcquireSRWLockExclusive(&t.lock);
@@ -695,7 +724,7 @@ void FgMeterNoteFrames(uint32_t generated, const char* source)
     const LONG n = generated > 16 ? 16 : (LONG) generated;
     if (InterlockedExchange(&g_noted, n) != n) XellLogF("fgmeter: %ld generated frame(s) per rendered frame (%s)", (long) n, source);
     for (Target& t : g_targets)
-        if (t.sc)
+        if (t.ctx)
         {
             AcquireSRWLockExclusive(&t.lock);
             t.pacer.NoteGenerated(n);
@@ -723,8 +752,10 @@ double FgMeterHeldMs(uint64_t fromNs, uint64_t toNs)
 void FgMeterXellFrame(double heldMs, double leftMs, double slackMs)
 {
     if (g_mode != 1) return;
-    // the hold made the next frame late only by what the low latency could not take off its wait
-    const double added = std::min(heldMs, std::max(0.0, -leftMs));
+    // the hold made the next frame late only by what neither the low latency's wait nor the VRR ceiling's (which comes
+    // after it, FgMeterCeilingWait) could take off: the frame starts at the later of the two
+    const double ceilLeft = g_ceilNextMs > 0 ? g_ceilNextMs - QpcMs() : -1e9;
+    const double added = std::min(heldMs, std::max(0.0, -std::max(leftMs, ceilLeft)));
     AcquireSRWLockExclusive(&g_xellLock);
     g_xSlack[g_xN % 4] = slackMs;
     g_xHeld[g_xN % 8] = heldMs;
@@ -738,4 +769,87 @@ void FgMeterXellFrame(double heldMs, double leftMs, double slackMs)
     ReleaseSRWLockExclusive(&g_xellLock);
     if (say) XellLogF("fgmeter: real frame: held %.2f ms in the game's present, low latency wait %.2f ms after taking it off,"
                       " slack %.2f ms, added latency %.3f ms", heldMs, leftMs, slackMs, added);
+}
+
+// TODO IGDEXT_FG_METER=2, vkd3d-proton's own frame rate limiter (IDXGIVkSwapChain2::SetTargetFrameRate on the presenter
+// captured from IDXGIVkSwapChainFactory::CreateSwapChain on XeSS-FG's queue, at real fps x (N + 1) under the VRR
+// ceiling, changed only past ~2 % since each change resets the limiter): not done. Without present timing (which needs
+// present_wait2 and a FIFO present mode) the limiter only delays the release of the internal frame latency semaphore
+// in the swap chain's wait thread (swapchain.c dxgi_vk_swap_chain_delay_next_frame, called from wait_worker), so the
+// game's Present blocks once 3 frames (VKD3D_SWAPCHAIN_LATENCY_FRAMES) are queued: pacing by back-pressure behind a
+// queue - more latency, and the game thread still waits. Worth it only where present timing is available.
+
+bool FgMeterAnswersDriver()
+{
+    FgMeterOn();
+    return g_mode == 1;
+}
+
+bool FgMeterDriverPresent(uint32_t sequence)
+{
+    FgMeterOn();
+    if (g_mode != 1) return false;
+    Target* t = g_lastTarget;
+    if (!t || !t->ctx) return true;
+    static volatile LONG said = 0;
+    if (InterlockedExchange(&said, 1) == 0)
+        XellLogF("fgmeter: XeSS-FG calls SetPresentSequenceNumber (%u): its presents are paced there, before Present1, on its"
+                 " presenting thread; no vtable is needed for them", sequence);
+    if (t_inPresent) return true;
+    Meter(*t);
+    AcquireSRWLockExclusive(&t->lock);
+    ++t->driverPresents;
+    ReleaseSRWLockExclusive(&t->lock);
+    t_driverMeteredMs = QpcMs();
+    return true;
+}
+
+namespace
+{
+// the VRR ceiling in Hz: IGDEXT_FG_METER_HZ, else the display mode's refresh rate, less 2 Hz; 0 = none
+double CeilingHz()
+{
+    static double hz = -1;
+    if (hz < 0)
+    {
+        char b[16] = {};
+        double v = 0; const char* from = "IGDEXT_FG_METER_HZ";
+        if (GetEnvironmentVariableA("IGDEXT_FG_METER_HZ", b, sizeof(b)) > 0) v = atof(b);
+        else
+        {
+            DEVMODEW dm = {}; dm.dmSize = sizeof(dm);
+            if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) v = dm.dmDisplayFrequency;
+            from = "the display mode";
+        }
+        hz = v >= 30 && v <= 1000 ? v - 2 : 0;
+        if (hz > 0) XellLogF("fgmeter: VRR ceiling %.0f Hz (%.0f Hz from %s, less 2): rendered frames start at least (generated + 1) / %.0f s apart", hz, v, from, hz);
+        else XellLogF("fgmeter: no VRR ceiling (no refresh rate from %s)", from);
+    }
+    return hz;
+}
+}
+
+void FgMeterCeilingWait()
+{
+    static double last = 0;
+    static int calls = 0, waits = 0; static double sumWait = 0;
+    if (g_mode != 1 || XefgFrameGenerationState() != 1) { last = 0; g_ceilNextMs = 0; return; }
+    const double hz = CeilingHz();
+    const LONG n = g_noted < 0 ? 1 : g_noted;
+    if (hz <= 0 || n <= 0) return;
+    const double minMs = (n + 1) * 1000.0 / hz;
+    const double now = QpcMs();
+    if (last && now < last + minMs && now - last < FgPacer::kGapMs)
+    {
+        WaitUntilMs(last + minMs);
+        ++waits; sumWait += last + minMs - now;
+    }
+    last = QpcMs();
+    g_ceilNextMs = last + minMs;
+    if (++calls == 600)
+    {
+        XellLogF("fgmeter: VRR ceiling %.0f Hz, %ld generated: %d of 600 rendered frames waited before input, avg %.2f ms"
+                 " (minimum %.2f ms per rendered frame)", hz, (long) n, waits, waits ? sumWait / waits : 0.0, minMs);
+        calls = waits = 0; sumWait = 0;
+    }
 }
