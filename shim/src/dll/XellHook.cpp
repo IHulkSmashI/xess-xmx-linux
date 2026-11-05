@@ -12,8 +12,11 @@
 //   IGDEXT_XELL_CAP=<us>    instead: at least this interval per displayed frame (XeLL's frame cap, in both of its modes),
 //                           up to 1000000; any other value turns both off
 //   IGDEXT_XELL_LOG=1       append the parameters the game passes and xellSleep timing (real frame rate) to C:\igdext_xell.log
+// Even flips for XeSS frame generation (IGDEXT_FG_METER, FgMeter.cpp) take their hooks from here: XeSS-FG's
+// initialization, present ids, frame count, on/off switch and destruction.
 #include "Stdafx.h"
 #include "Trace.h"
+#include "FgMeter.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +44,7 @@ static uint32_t g_mfg = 0;   // generated frames per rendered frame, 0 = frame g
 static volatile bool g_fgSeen = false;
 static volatile LONG g_fgState = -1;   // -1 not seen, 0 off, 1 on: the newer of the two calls
 static volatile const char* g_fgSource = "not seen";
+int XefgFrameGenerationState() { return (int) g_fgState; }
 static bool g_fixCap = false; static uint32_t g_effInterval = 0, g_savedInterval = 0; static ULONGLONG g_fgOnTick = 0;
 static volatile LONG g_sleepCalls = 0;
 typedef uint32_t (*PFN_XellSetLog)(void*, uint32_t, void (*)(const char*, uint32_t));
@@ -63,6 +67,15 @@ static void XLog(const char* fmt, ...)
     fprintf(f, "%02d:%02d:%02d.%03d [%lu] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, GetCurrentThreadId());
     va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
     fputc('\n', f); fclose(f);
+}
+
+bool XellLogOn() { return g_log; }
+void XellLogF(const char* fmt, ...)
+{
+    if (!g_log) return;
+    char b[1024];
+    va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof(b), fmt, ap); va_end(ap);
+    XLog("%s", b);
 }
 
 static void XellLogCb(const char* msg, uint32_t level)
@@ -425,9 +438,11 @@ void StartXellHook()
             else g_capUs = 0, g_capBad = true;
         }
     }
-    if (!g_fixCap && !g_log && !g_capUs && !g_capAuto) return;
+    // FgMeter needs the frame generation switch of XeLL as well (a game that switches it there only)
+    if (!g_fixCap && !g_log && !g_capUs && !g_capAuto && !FgMeterOn()) return;
     XLog("low latency: %s", g_capAuto ? "on" : g_capUs ? "fixed cap" : g_capBad ? "off (IGDEXT_XELL_CAP not off, auto[:ms] or 0..1000000 us)" : "off");
     XLog("XellHook start in %s", exe);
+    XLog("even flips for frame generation (IGDEXT_FG_METER): %s", FgMeterOn() ? "on" : "off, measured in the log only");
     if (!StartModuleRefThread(XellThread)) XLog("XeLL hook thread not started (%lu)", GetLastError());
 }
 
@@ -597,9 +612,12 @@ static void XefgInitBefore(const char* name, void* ctx, const void* params)
 }
 static void XefgInitAfter(void* ctx, int32_t r)
 {
-    if (!g_fgLog) return;
+    if (!g_fgLog && !FgMeterWanted()) return;
     XefgInitParams got = {};
     int32_t g = g_fgGetInit ? g_fgGetInit(ctx, &got) : -1;
+    if (r == 0 && g == 0 && got.maxInterpolatedFrames && got.maxInterpolatedFrames < 16)
+        FgMeterNoteFrames(got.maxInterpolatedFrames, "xefgSwapChainD3D12InitFromSwapChain(Desc)");
+    if (!g_fgLog) return;
     FLog("  -> %d; initialization parameters (%d): maxInterpolatedFrames %u", r, g, got.maxInterpolatedFrames);
     XefgReportMax(ctx, "after initialization");
 }
@@ -607,7 +625,9 @@ static void XefgInitAfter(void* ctx, int32_t r)
 static int32_t Hook_XefgInit(void* ctx, void* queue, const void* params)
 {
     XefgInitBefore("xefgSwapChainD3D12InitFromSwapChain", ctx, params);
+    FgMeterInitBegin(params ? ((const XefgInitParams*) params)->pApplicationSwapChain : nullptr, nullptr);
     int32_t r = g_fgInit(ctx, queue, params);
+    FgMeterInitEnd(ctx, r);
     XefgInitAfter(ctx, r);
     return r;
 }
@@ -617,7 +637,9 @@ static PFN_XefgInitDesc g_fgInitDescFn;
 static int32_t Hook_XefgInitDesc(void* ctx, HWND wnd, const void* desc, const void* fsDesc, void* queue, void* factory, const void* params)
 {
     XefgInitBefore("xefgSwapChainD3D12InitFromSwapChainDesc", ctx, params);
+    FgMeterInitBegin(nullptr, factory);
     int32_t r = g_fgInitDescFn(ctx, wnd, desc, fsDesc, queue, factory, params);
+    FgMeterInitEnd(ctx, r);
     XefgInitAfter(ctx, r);
     return r;
 }
@@ -636,11 +658,12 @@ static int32_t Hook_XefgSetNum(void* ctx, uint32_t n)
         {
             int32_t r = g_fgSetNum(ctx, m);
             FLog("xefgSwapChainSetNumInterpolatedFrames(%u): XESS_FG=%d -> %u -> %d", n, want, m, r);
-            if (r == 0) return r;
+            if (r == 0) { FgMeterNoteFrames(m, "xefgSwapChainSetNumInterpolatedFrames, XESS_FG"); return r; }
         }
     }
     int32_t r = g_fgSetNum(ctx, n);
     FLog("xefgSwapChainSetNumInterpolatedFrames(%u) -> %d", n, r);
+    if (r == 0) FgMeterNoteFrames(n, "xefgSwapChainSetNumInterpolatedFrames");
     return r;
 }
 
@@ -662,6 +685,7 @@ static int32_t Hook_XefgTagConstants(void* ctx, uint32_t id, const XefgFrameCons
         FLog("constants #%ld id %u: view %s; jitter %.3f,%.3f mvScale %.1f,%.1f reset %u renderTime %.6g", k, id, b,
              c->jitterX, c->jitterY, c->mvScaleX, c->mvScaleY, c->reset, c->renderTime);
     }
+    FgMeterRealFrame(ctx, id);   // one per rendered frame: FgMeter's real-frame interval
     return g_fgTagConstants(ctx, id, c);
 }
 
@@ -707,6 +731,16 @@ static int32_t Hook_XefgSetEnabled(void* ctx, uint32_t enable)
     const int32_t r = g_fgSetEnabled(ctx, enable);
     if (r == 0) { g_fgSource = "xefgSwapChainSetEnabled"; InterlockedExchange(&g_fgState, enable != 0); }
     FLog("xefgSwapChainSetEnabled(%u) -> %d", enable, r);
+    return r;
+}
+
+// xefgSwapChainDestroy(ctx): FgMeter stops pacing that context's swap chain
+static PFN_XefgDestroy g_fgDestroyOrig;
+static int32_t Hook_XefgDestroy(void* ctx)
+{
+    FgMeterContextDestroyed(ctx);
+    const int32_t r = g_fgDestroyOrig(ctx);
+    FLog("xefgSwapChainDestroy(%p) -> %d", ctx, r);
     return r;
 }
 
@@ -758,6 +792,10 @@ static bool XefgInstallHooks()
         // XeLL reports frame generation
         if (void* e = (void*) GetProcAddress(m, "xefgSwapChainSetEnabled"))
             FLog("xefgSwapChainSetEnabled %s", PatchThunk(e, (void*) Hook_XefgSetEnabled, (void**) &g_fgSetEnabled, "xefgSwapChainSetEnabled") ? "hooked" : "NOT hooked");
+        // FgMeter only (g_fgDestroy stays the export: XefgRaise's probe context goes through this hook too)
+        if (FgMeterWanted())
+            if (void* e = (void*) GetProcAddress(m, "xefgSwapChainDestroy"))
+                FLog("xefgSwapChainDestroy %s", PatchThunk(e, (void*) Hook_XefgDestroy, (void**) &g_fgDestroyOrig, "xefgSwapChainDestroy") ? "hooked" : "NOT hooked");
         g_fgHookedModule = m;
         g_fgHooked = 1;
         done = true;
@@ -790,12 +828,13 @@ static DWORD WINAPI XefgThread(LPVOID)
 
 void StartXefgHook()
 {
-    // the log (IGDEXT_XEFG_LOG=1), the frame generation override (XESS_FG) or the low latency (its on/off source, after
-    // StartXellHook set g_capAuto) needs the hooks
+    // the log (IGDEXT_XEFG_LOG=1), the frame generation override (XESS_FG), the low latency (its on/off source, after
+    // StartXellHook set g_capAuto) or the even flips (IGDEXT_FG_METER, or its measurement with IGDEXT_XELL_LOG) need
+    // the hooks
     char b[8];
     g_fgLog = GetEnvironmentVariableA("IGDEXT_XEFG_LOG", b, sizeof(b)) > 0 && atoi(b);
     bool raise = GetEnvironmentVariableA("XESS_FG", b, sizeof(b)) > 0 && atoi(b) >= 2;   // also 2..4: the game's own number
-    if (!g_fgLog && !raise && !g_capAuto) return;
+    if (!g_fgLog && !raise && !g_capAuto && !FgMeterWanted()) return;
     g_fgWanted = true;
     if (XefgInstallHooks()) return;   // already loaded (it loaded the shim): hook now, not later
     if (!StartModuleRefThread(XefgThread)) FLog("XeFG hook thread not started (%lu)", GetLastError());

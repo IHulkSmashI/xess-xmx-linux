@@ -29,6 +29,10 @@ jobs:
         run: |
           python3 tools/check_dyn_ids.py patches/0001-anv-cm-kernel-injection.patch
           python3 tools/check_dyn_ids.py patches/mesa-26.3/0001-anv-cm-kernel-injection.patch
+      - name: frame generation pacing (shim/src/dll/FgPacer.h)
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -I shim/src/dll shim/tests/fgpacer_test.cpp -o fgpacer_test
+          ./fgpacer_test
       - name: debug tools stay out of the feature patch
         run: |
           ! grep -n -E '^\+.*(ANV_CM_(GCAP|CAPTURE|VIEW|ONLY|SKIP|SYNC|MAXGROUPS|PREEMPT|PC)|anv_cm_bos|XMX-DEBUG)' patches/0001-anv-cm-kernel-injection.patch patches/mesa-26.3/0001-anv-cm-kernel-injection.patch

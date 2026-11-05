@@ -33,6 +33,7 @@
 // here is active and every function answers "not supported", as before.
 #include "Stdafx.h"
 #include "Trace.h"
+#include "FgMeter.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -261,13 +262,15 @@ HRESULT _INTC_D3D12_RenderSubmitStart(INTCExtensionContext*, uint32_t frameId)
 }
 
 // XeLL / XeSS-FG pacing information. On Windows the driver uses these to pace generated frames and to match
-// present sequence numbers against render-submit timings. The probe accepts them (S_OK) so that a failed call here
+// present sequence numbers against render-submit timings. The shim's own pacing of XeSS-FG's presents is FgMeter.cpp
+// (IGDEXT_FG_METER); the generated-frame count from here goes to it as a hint. The probe accepts them (S_OK) so that a failed call here
 // cannot be the reason XeLL stays in cross-vendor mode; the values are logged to see how XeLL uses them.
 HRESULT _INTC_D3D12_SetNumGeneratedFrames(INTCExtensionContext*, UINT NumFrames)
 {
     static LONG n = 0; static UINT last = ~0u;
     const LONG k = InterlockedIncrement(&n);
     if (NumFrames != last || k <= 8) { TraceF("XELLPROBE SetNumGeneratedFrames(%u) #%ld", NumFrames, (long)k); last = NumFrames; }
+    FgMeterNoteFrames(NumFrames, "INTC_D3D12_SetNumGeneratedFrames");   // what the driver would pace (FgMeter.cpp)
     return ProbeVersion() > 0 ? S_OK : E_NOTIMPL;
 }
 
