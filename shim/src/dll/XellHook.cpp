@@ -626,8 +626,9 @@ static void XefgInitAfter(void* ctx, int32_t r)
     if (!g_fgLog && !FgMeterWanted()) return;
     XefgInitParams got = {};
     int32_t g = g_fgGetInit ? g_fgGetInit(ctx, &got) : -1;
-    if (r == 0 && g == 0 && got.maxInterpolatedFrames && got.maxInterpolatedFrames < 16)
-        FgMeterNoteFrames(got.maxInterpolatedFrames, "xefgSwapChainD3D12InitFromSwapChain(Desc)");
+    // not noted for the meter: maxInterpolatedFrames is what the game may ask for (3 to offer 4x), not what it runs; a
+    // game at 2x that never calls SetNumInterpolatedFrames would get a VRR ceiling for 4x (half its frame rate).
+    // Without a note the meter counts presents per real frame from the frame marks, and the ceiling assumes 2x.
     if (!g_fgLog) return;
     FLog("  -> %d; initialization parameters (%d): maxInterpolatedFrames %u", r, g, got.maxInterpolatedFrames);
     XefgReportMax(ctx, "after initialization");
