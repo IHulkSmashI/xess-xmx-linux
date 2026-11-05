@@ -1,2 +1,2 @@
-Test build of igdext64.dll with XeFG flip metering (branch xefg-flip-metering, commit c52f6a6, CI run 41956549465).
-sha256 08d25a637559635fd2bcf50eafa1c24545742304e64482ba38bbd61ba5a8e537
+Test build of igdext64.dll with XeFG flip metering (branch xefg-flip-metering, commit 502d7a5, CI run 41979637848).
+sha256 601e48f052ad9c6fecfadc6d7d0f85804dda33631d318ca2aacc5e8d73478872
