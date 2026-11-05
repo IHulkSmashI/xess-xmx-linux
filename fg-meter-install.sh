@@ -3,7 +3,7 @@
 # Undo: bash fg-meter-install.sh undo
 set -e
 URL=https://raw.githubusercontent.com/IHulkSmashI/xess-xmx-linux/fg-meter-test-build/igdext64.dll
-SHA=601e48f052ad9c6fecfadc6d7d0f85804dda33631d318ca2aacc5e8d73478872
+SHA=dfe3e5ddcdd53a4351807507400af363ca18c1026817efeb95fe993556973b90
 APPID=${APPID:-3669870}   # CONTROL Resonant; another game: APPID=<steam app id> bash fg-meter-install.sh
 PKG=$(dirname "$(find ~/.local/share/clawdeck -path '*xess-xmx-linux-*' -name igdext64.dll | sort | tail -1)")
 PFX=$(ls -d ~/.local/share/Steam/steamapps/compatdata/$APPID /run/media/*/*/steamapps/compatdata/$APPID 2>/dev/null | head -1)
