@@ -132,7 +132,7 @@ static void AutoPaceWait(void* ctx, uint32_t frame)
     if (!fgOn || !g_reports) { uncappedMs = 0; gN = 0; since = 0; paced = 0; cpuBase = 1e9; queued = 0; return; }
     memset(r, 0, sizeof(r));
     if (g_reports(ctx, r) != 0) return;
-    uint32_t top = 0, low = 0xFFFFFFFFu; uint64_t topE = 0, lowE = 0; double cpuMin = 1e9;
+    uint32_t top = 0, low = 0xFFFFFFFFu; uint64_t topS = 0, topE = 0, lowS = 0, lowE = 0; double cpuMin = 1e9;
     for (int i = 0; i < 64; ++i)
     {
         if (!r[i].id || !r[i].prE) continue;   // not finished yet: frames in flight
@@ -143,9 +143,15 @@ static void AutoPaceWait(void* ctx, uint32_t frame)
             const double c = (r[i].rsS - r[i].simS) / 1e6;
             if (c >= kCpuFloorMs && c < 1000 && c < cpuMin) cpuMin = c;
         }
-        if (r[i].id > top) { top = r[i].id; topE = r[i].prE; }
-        if (r[i].id < low) { low = r[i].id; lowE = r[i].prE; }
+        if (r[i].id > top) { top = r[i].id; topS = r[i].prS; topE = r[i].prE; }
+        if (r[i].id < low) { low = r[i].id; lowS = r[i].prS; lowE = r[i].prE; }
     }
+    // IGDEXT_FG_METER=1 holds XeSS-FG's presents inside the game's Present, so the present end XeLL reports is later by
+    // the hold; on Windows the driver meters the flips without that. The hold is taken off, so each start is where it
+    // would be without the meter and the hold replaces part of this wait instead of adding to it (FgMeter.h).
+    const double heldTop = FgMeterHeldMs(topS, topE);
+    topE -= (uint64_t) (heldTop * 1e6);
+    lowE -= (uint64_t) (FgMeterHeldMs(lowS, lowE) * 1e6);
     if (!top || top == low || topE <= lowE || frame <= top || frame - top > 16) return;
     const double gMs = (topE - lowE) / 1e6 / (top - low);
     if (gMs > 150) { uncappedMs = 0; gN = 0; since = 0; paced = 0; cpuBase = 1e9; queued = 0; return; }   // a loading screen
@@ -187,6 +193,9 @@ static void AutoPaceWait(void* ctx, uint32_t frame)
     const double cpuMs = started ? cpuMin : kStartCpuMs;
     const double leftMs = ((double) topE - (double) nowNs) / 1e6 + q * g - cpuMs - g_autoMarginMs;
     lastLeft = leftMs; lastG = g; lastQ = q; lastCpu = cpuMs;
+    // to the meter: how much of its hold this start absorbed, and how much the next frames can (from the present end
+    // without the hold to this start)
+    FgMeterXellFrame(heldTop, leftMs, leftMs + ((double) nowNs - (double) topE) / 1e6);
     const double sleepMs = leftMs < 0 ? 0 : leftMs > g * 2 ? g * 2 : leftMs;
     if (sleepMs > 0)
     {
@@ -439,10 +448,10 @@ void StartXellHook()
         }
     }
     // FgMeter needs the frame generation switch of XeLL as well (a game that switches it there only)
-    if (!g_fixCap && !g_log && !g_capUs && !g_capAuto && !FgMeterOn()) return;
+    if (!g_fixCap && !g_log && !g_capUs && !g_capAuto && !FgMeterWanted()) return;
     XLog("low latency: %s", g_capAuto ? "on" : g_capUs ? "fixed cap" : g_capBad ? "off (IGDEXT_XELL_CAP not off, auto[:ms] or 0..1000000 us)" : "off");
     XLog("XellHook start in %s", exe);
-    XLog("even flips for frame generation (IGDEXT_FG_METER): %s", FgMeterOn() ? "on" : "off, measured in the log only");
+    XLog("even flips for frame generation (IGDEXT_FG_METER): %s", FgMeterOn() ? "on" : FgMeterWanted() ? "measuring only" : "off, nothing installed");
     if (!StartModuleRefThread(XellThread)) XLog("XeLL hook thread not started (%lu)", GetLastError());
 }
 
@@ -829,8 +838,7 @@ static DWORD WINAPI XefgThread(LPVOID)
 void StartXefgHook()
 {
     // the log (IGDEXT_XEFG_LOG=1), the frame generation override (XESS_FG), the low latency (its on/off source, after
-    // StartXellHook set g_capAuto) or the even flips (IGDEXT_FG_METER, or its measurement with IGDEXT_XELL_LOG) need
-    // the hooks
+    // StartXellHook set g_capAuto) or the even flips (IGDEXT_FG_METER=1 or measure) need the hooks
     char b[8];
     g_fgLog = GetEnvironmentVariableA("IGDEXT_XEFG_LOG", b, sizeof(b)) > 0 && atoi(b);
     bool raise = GetEnvironmentVariableA("XESS_FG", b, sizeof(b)) > 0 && atoi(b) >= 2;   // also 2..4: the game's own number
